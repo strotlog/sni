@@ -687,7 +687,11 @@ achievements with.
 
 Version 1.9.2 and later added new commands `READ_CORE_MEMORY` and
 `WRITE_CORE_MEMORY` which are not dependent on the Cheevos system and are
-better designed to be general purpose memory access commands.
+better designed to be general purpose memory access commands. However, they are
+still not available for cores that do not announce memory descriptors to
+RetroArch, such as the snes9x core, so SNI falls back to `READ_CORE_RAM`
+and `WRITE_CORE_RAM` for cores like this, meaning, among the other things noted
+here, that ROM reads are not available.
 
 The older `WRITE_CORE_RAM` command does not send back a reply for successful
 writes. Without this reply, SNI does not know when the write completed thus

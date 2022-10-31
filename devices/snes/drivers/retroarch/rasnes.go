@@ -254,13 +254,13 @@ func (c *RAClient) DetermineSnesMemoryApiByTesting(logDetector bool) (err error)
 	}
 	testCases := []TestCase{
 		// if $00:ffc0 is available, very likely ROM+SRAM+RAM are all available via RCM
-		TestCase{command: "READ_CORE_MEMORY 00ffc0 32",
+		{command: "READ_CORE_MEMORY 00ffc0 32",
 			ifSuccessEquals: true,
 			thenSetRcrTo:    false,
 			warnOnFail:      false,
 			shortName:       "RCM ROM"},
 		// if RCR is responding, very likely SRAM+RAM are both available via RCR
-		TestCase{command: "READ_CORE_RAM 00 32",
+		{command: "READ_CORE_RAM 00 32",
 			ifSuccessEquals: true,
 			thenSetRcrTo:    true,
 			warnOnFail:      true,
@@ -269,7 +269,7 @@ func (c *RAClient) DetermineSnesMemoryApiByTesting(logDetector bool) (err error)
 		// if we have RAM access, that's something.
 		// (SRAM may be available too if a gRPC client knows its address and knows the game.)
 		// if not, this is not a useful SNES device, and we fail
-		TestCase{command: "READ_CORE_MEMORY 7e0000 32",
+		{command: "READ_CORE_MEMORY 7e0000 32",
 			ifSuccessEquals: true,
 			thenSetRcrTo:    false,
 			warnOnFail:      true,
@@ -512,7 +512,7 @@ func (c *RAClient) RequiresMemoryMappingForAddress(ctx context.Context, address 
 	return true, nil
 }
 
-var ErrRAUnknownMapping = fmt.Errorf("only WRAM is available, and SRAM in FxPakPro-space requests, due to falling back to RA RCR (READ_CORE_RAM) with no bus mapping")
+var ErrRAUnknownMapping = fmt.Errorf("only RAM (WRAM+SRAM) is available, and the A-bus memory mapping is unknown, due to falling back to RA RCR (READ_CORE_RAM)")
 
 func (c *RAClient) RATranslateAddress(
 	sourceAddress devices.AddressTuple,
@@ -529,13 +529,14 @@ func (c *RAClient) RATranslateAddress(
 		// RA does not speak bus mapping, so translate RAM and ROM addresses to READ_CORE_RAM space:
 		// 0-$1ffff: RAM
 		// $20000-onward: SRAM
+		rcrSramStart := uint32(0x2_0000)
 		switch sourceAddress.AddressSpace {
 		case sni.AddressSpace_Raw:
 			return sourceAddress.Address, nil
 		case sni.AddressSpace_FxPakPro:
 			// SRAM
 			if sourceAddress.Address >= 0xE0_0000 && sourceAddress.Address <= 0xEF_FFFF {
-				return (sourceAddress.Address - 0xE0_0000 + 0x2_0000), nil
+				return (sourceAddress.Address - 0xE0_0000 + rcrSramStart), nil
 			}
 			// WRAM
 			if sourceAddress.Address >= 0xF5_0000 && sourceAddress.Address <= 0xF6_FFFF {
@@ -543,16 +544,29 @@ func (c *RAClient) RATranslateAddress(
 			}
 			return 0, ErrRAUnknownMapping
 		case sni.AddressSpace_SnesABus:
+			bank := (sourceAddress.Address & 0xFF_0000) >> 16
 			// WRAM
-			if sourceAddress.Address >= 0x7E_0000 && sourceAddress.Address <= 0x7F_FFFF {
+			if bank == 0x7E || bank == 0x7F {
 				return (sourceAddress.Address - 0x7E_0000), nil
 			}
-			// there is no way to be sure if the request wanted SRAM:
-			// - if it looks like a HiROM SRAM request, the client could have meant LoROM
-			//   enhancement chip memory instead
-			// - if it looks like a LoROM SRAM request, the client could have meant HiROM ROM space
-			//   instead
-			return 0, ErrRAUnknownMapping
+			// SRAM, best effort depending on what memory map type was *requested* (we don't know the
+			// actual memory map ourselves)
+			if (sourceAddress.MemoryMapping == sni.MemoryMapping_HiROM ||
+				sourceAddress.MemoryMapping == sni.MemoryMapping_ExHiROM) &&
+				((bank >= 0x20 && bank <= 0x3F) || (bank >= 0xA0 && bank <= 0xBF)) &&
+				(sourceAddress.Address&0x00_E000) == 0x00_6000 { // must be xx:6xxx or xx:7xxx
+
+				numbanks := (bank % 0x80) - 0x20
+				return ((numbanks * 0x2000) + (sourceAddress.Address & 0x1FFF) + rcrSramStart), nil
+			}
+			if sourceAddress.MemoryMapping == sni.MemoryMapping_LoROM &&
+				((bank >= 0x70 && bank <= 0x7D) || (bank >= 0xF0 && bank <= 0xFF)) &&
+				(sourceAddress.Address&0x00_FFFF) < 0x00_8000 {
+				numbanks := (bank % 0x80) - 0x70
+				return ((numbanks * 0x8000) + sourceAddress.Address + rcrSramStart), nil
+			}
+
+			// not available. unknown mapping looking for SRAM, or known/unknown mapping looking for rom			return 0, ErrRAUnknownMapping
 		}
 		return 0, ErrRAUnknownMapping
 	}
