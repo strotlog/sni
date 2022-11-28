@@ -132,35 +132,16 @@ func (c *RAClient) Connect(addr *net.UDPAddr) (err error) {
 	return
 }
 
-func (c *RAClient) DetectLoopback(others []*RAClient) bool {
-	for i := range others {
-		other := others[i]
-
-		// detect loopback condition:
-		laddr := c.UDPClient.LocalAddr()
-		raddr := other.UDPClient.RemoteAddr()
-		if laddr == nil {
-			continue
-		}
-		if raddr == nil {
-			continue
-		}
-		if laddr.Port == raddr.Port {
-			if laddr.IP.Equal(raddr.IP) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
 func (c *RAClient) GetId() string {
 	return c.addr.String()
 }
 
 func (c *RAClient) GetRemoteAddr() *net.UDPAddr {
 	return c.addr
+}
+
+func (c *RAClient) GetLocalAddr() *net.UDPAddr {
+	return c.UDPClient.LocalAddr()
 }
 
 func (c *RAClient) Version() string {

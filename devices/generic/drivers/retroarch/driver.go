@@ -24,13 +24,22 @@ var driver *Driver
 type Driver struct {
 	container devices.DeviceContainer
 
+	localUdpPortsToAvoid map[int]struct{}
+
 	detectors []*retroarch.RAClient
 }
 
 func NewDriver(addresses []*net.UDPAddr) *Driver {
 	d := &Driver{
-		detectors: make([]*retroarch.RAClient, len(addresses)),
+		detectors:            make([]*retroarch.RAClient, len(addresses)),
+		localUdpPortsToAvoid: make(map[int]struct{}),
 	}
+
+	// retroarch addresses are often on the local machine, so do not bind on any of their port numbers
+	for _, addr := range addresses {
+		d.localUdpPortsToAvoid[addr.Port] = struct{}{}
+	}
+
 	d.container = devices.NewDeviceDriverContainer(d.openDevice)
 
 	for i, addr := range addresses {
@@ -78,7 +87,7 @@ func (d *Driver) openDevice(uri *url.URL) (q devices.Device, err error) {
 
 	var c *retroarch.RAClient
 	c = retroarch.NewRAClient(addr, addr.String(), time.Second*5)
-	err = c.Connect(addr)
+	err = d.connectWithGoodLocalPort(c, addr)
 	if err != nil {
 		return
 	}
@@ -94,6 +103,32 @@ func (d *Driver) openDevice(uri *url.URL) (q devices.Device, err error) {
 
 	q = c
 	return
+}
+
+func (d *Driver) connectWithGoodLocalPort(client *retroarch.RAClient, raddr *net.UDPAddr) error {
+	numPortAllocRetries := 30
+
+	for numPortAllocRetries > 0 {
+
+		err := client.Connect(raddr)
+		if err != nil {
+			if logDetector {
+				log.Printf("retroarch: connect to %s: %v\n", raddr.String(), err)
+			}
+			return err
+		}
+
+		// return if we allocated a good port
+		if _, ok := d.localUdpPortsToAvoid[client.GetLocalAddr().Port]; !ok {
+			return nil // success
+		}
+
+		// retry. assumes multiple Connect() attempts tend to use different local ports
+		numPortAllocRetries--
+	}
+	err := fmt.Errorf("Could not allocate a port outside localUdpPortsToAvoid")
+	log.Printf("retroarch: %v")
+	return err
 }
 
 func (d *Driver) Detect() (devs []devices.DeviceDescriptor, err error) {
@@ -123,17 +158,10 @@ func (d *Driver) Detect() (devs []devices.DeviceDescriptor, err error) {
 			// reconnect detector if necessary:
 			if !detector.IsConnected() {
 				// "connect" to this UDP endpoint:
-				err = detector.Connect(detector.GetRemoteAddr())
+				err = d.connectWithGoodLocalPort(detector, detector.GetRemoteAddr())
 				if err != nil {
 					if logDetector {
 						log.Printf("retroarch: detect: detector[%d]: connect: %v\n", i, err)
-					}
-					return
-				}
-				if detector.DetectLoopback(d.detectors) {
-					detector.Close()
-					if logDetector {
-						log.Printf("retroarch: detect: detector[%d]: loopback connection detected; breaking\n", i)
 					}
 					return
 				}

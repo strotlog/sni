@@ -1,6 +1,8 @@
 .DS_Store
 .idea/
 *.pdf
+*.swp
+sni.exe
 dist/
 node_modules/
 content/
