@@ -10,11 +10,11 @@ import (
 	"sni/cmd/sni/config"
 	"sni/cmd/sni/logging"
 	"sni/cmd/sni/tray"
+	"sni/devices/generic/drivers/retroarch"
 	"sni/devices/snes/drivers/emunwa"
 	"sni/devices/snes/drivers/fxpakpro"
 	"sni/devices/snes/drivers/luabridge"
 	"sni/devices/snes/drivers/mock"
-	"sni/devices/snes/drivers/retroarch"
 	"sni/services/grpcimpl"
 	"sni/services/usb2snes"
 )

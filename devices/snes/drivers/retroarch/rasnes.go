@@ -22,6 +22,8 @@ import (
 
 const hextable = "0123456789abcdef"
 
+const defaultSnesAddressSpace = sni.AddressSpace_SnesABus
+
 type readOperation struct {
 	RequestAddress devices.AddressTuple
 	DeviceAddress  devices.AddressTuple
@@ -120,6 +122,9 @@ func (c *RAClient) Close() (err error) {
 }
 
 func (c *RAClient) Connect(addr *net.UDPAddr) (err error) {
+	c.closeLock.Lock()
+	c.version = ""
+	c.closeLock.Unlock()
 	if err = c.UDPClient.Connect(addr); err != nil {
 		return
 	}
@@ -154,6 +159,10 @@ func (c *RAClient) GetId() string {
 	return c.addr.String()
 }
 
+func (c *RAClient) GetRemoteAddr() *net.UDPAddr {
+	return c.addr
+}
+
 func (c *RAClient) Version() string {
 	defer c.stateLock.Unlock()
 	c.stateLock.Lock()
@@ -167,7 +176,7 @@ func (c *RAClient) HasVersion() bool {
 	return c.version != ""
 }
 
-func (c *RAClient) DetermineVersionAndSystemAndApi() (systemId string, err error) {
+func (c *RAClient) DetermineVersionAndSystemAndApi(logDetector bool) (systemId string, err error) {
 	var rsp []byte
 	req := []byte("VERSION\n")
 	if logDetector {
@@ -249,12 +258,12 @@ func (c *RAClient) DetermineVersionAndSystemAndApi() (systemId string, err error
 	c.rcrHasBusMapping = false
 	if systemId == "super_nes" {
 		// 1.10.1+
-		err = c.DetermineSnesMemoryApiByTesting()
+		err = c.DetermineSnesMemoryApiByTesting(logDetector)
 	}
 	return
 }
 
-func (c *RAClient) DetermineSnesMemoryApiByTesting() (err error) {
+func (c *RAClient) DetermineSnesMemoryApiByTesting(logDetector bool) (err error) {
 	type TestCase struct {
 		command         string
 		ifSuccessEquals bool
