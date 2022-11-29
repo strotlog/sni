@@ -46,6 +46,7 @@ type rwRequest struct {
 
 	isWrite bool
 	command string
+	rsp     []byte
 	address uint32
 
 	Read  readOperation
@@ -54,7 +55,7 @@ type rwRequest struct {
 }
 
 type RAClient struct {
-	udpclient.UDPClient
+	*udpclient.UDPClient
 	stateLock sync.Mutex
 
 	addr *net.UDPAddr
@@ -97,7 +98,7 @@ func NewRAClient(addr *net.UDPAddr, name string, timeout time.Duration) *RAClien
 		outgoing:         make(chan *rwRequest, 8),
 		expectedIncoming: make(chan *rwRequest, 8),
 	}
-	udpclient.MakeUDPClient(name, &c.UDPClient)
+	c.UDPClient = udpclient.NewUDPClient(name)
 
 	go c.handleIncoming()
 	go c.handleOutgoing()
@@ -164,6 +165,7 @@ func (c *RAClient) DetermineVersionAndSystemAndApi(logDetector bool) (systemId s
 		log.Printf("retroarch: > %s", req)
 	}
 	rsp, err = c.WriteThenRead(req, time.Now().Add(c.readWriteTimeout))
+	log.Printf("%v %v\n", rsp, err) // temp
 	if err != nil {
 		return
 	}
@@ -469,7 +471,7 @@ func (c *RAClient) writeCommand() string {
 	c.stateLock.Lock()
 
 	if c.useRCR {
-		return "WRITE_CORE_RAM"
+		return "READ_CORE_RAM 0 1\nWRITE_CORE_RAM"
 	} else {
 		return "WRITE_CORE_MEMORY"
 	}
@@ -808,7 +810,7 @@ func (c *RAClient) handleOutgoing() {
 	defer util.Recover()
 
 	c.stateLock.Lock()
-	useRCR := c.useRCR
+	//useRCR := c.useRCR
 	c.stateLock.Unlock()
 
 	for rwreq := range c.outgoing {
@@ -844,7 +846,7 @@ func (c *RAClient) handleOutgoing() {
 				log.Printf("retroarch: > %s", reqStr)
 			}
 
-			err := c.WriteWithDeadline([]byte(reqStr), rwreq.deadline)
+			rsp, err := c.WriteThenRead([]byte(reqStr), rwreq.deadline)
 			if err != nil {
 				c.expectationLock.Unlock()
 				rwreq.R <- err
@@ -853,14 +855,10 @@ func (c *RAClient) handleOutgoing() {
 				}
 				return
 			}
+			rwreq.rsp = rsp
 
-			if useRCR && rwreq.isWrite {
-				// fake a response since we don't get any from WRITE_CORE_RAM:
-				rwreq.R <- nil
-			} else {
-				// we're now expecting an incoming response:
-				c.expectedIncoming <- rwreq
-			}
+			// we're now expecting an incoming response:
+			c.expectedIncoming <- rwreq
 		}
 		c.expectationLock.Unlock()
 	}
@@ -870,14 +868,8 @@ func (c *RAClient) handleIncoming() {
 	defer util.Recover()
 
 	for rwreq := range c.expectedIncoming {
-		rsp, err := c.ReadWithDeadline(rwreq.deadline)
-		if err != nil {
-			rwreq.R <- err
-			if isCloseWorthy(err) {
-				_ = c.Close()
-			}
-			break
-		}
+		var err error
+		rsp := rwreq.rsp
 
 		if config.VerboseLogging {
 			log.Printf("retroarch: < %s", rsp)
@@ -1022,5 +1014,20 @@ func (c *RAClient) PauseToggle(ctx context.Context) (err error) {
 		log.Printf("retroarch: > %s", req)
 	}
 	err = c.WriteWithDeadline(req, deadline)
+	return
+}
+
+// temporary
+func (c *RAClient) WriteWithDeadline(write []byte, deadline time.Time) error {
+	return c.SendMessageNowExpectingNoResponse(write)
+}
+func (c *RAClient) WriteThenRead(write []byte, deadline time.Time) (rsp []byte, err error) {
+	ctx, _ := context.WithDeadline(context.Background(), deadline)
+	completion := <-c.StartRequest(ctx, &udpclient.UDPRequestExpectingResponse{
+		UDPToSend:             write,
+		ResponseMustBeginWith: []byte(""),
+	})
+	rsp = completion.Answer
+	err = completion.Error
 	return
 }
