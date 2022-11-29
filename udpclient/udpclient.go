@@ -3,11 +3,9 @@ package udpclient
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"time"
 	"sni/util"
@@ -25,15 +23,16 @@ type UDPClient struct {
 	isConnected bool
 	isClosed    bool
 
-	closeChannel  chan struct{}
-	workerDone    chan struct{}
+	newRequestsAddedNotified     bool
+	newRequestsAddedNotification chan struct{}
+	closeWorkerChannel           chan struct{}
+	workersDone                  chan struct{}
+	incomingMessages             chan []byte
 
 	queuesLock                  sync.Mutex
 	inflight                    []*UDPRequestTracker
 	queued                      []*UDPRequestTracker
 	presumedDroppedResponses    []*UDPPresumedDropped
-	inflightDoorbellRung        bool
-	inflightDoorbell            chan struct{}
 	udpRetryTimeout             time.Duration
 	udpConfidentDroppedTime     time.Duration
 	nextTimeout                 time.Time
@@ -46,15 +45,13 @@ const defaultUDPConfidentDroppedTime = time.Second * 5
 func NewUDPClient(name string) *UDPClient {
 	c := &UDPClient{
 		name: name,
-		closeChannel: make(chan struct{}, 5),
-		workerDone: make(chan struct{}, 1),
-		inflightDoorbell: make(chan struct{}, 1),
+		newRequestsAddedNotification: make(chan struct{}, 1),
+		closeWorkerChannel: make(chan struct{}, 5),
+		workersDone: make(chan struct{}, 2),
+		incomingMessages : make(chan []byte),
 		udpRetryTimeout: defaultUDPRetryTimeout,
 		udpConfidentDroppedTime: defaultUDPConfidentDroppedTime,
 	}
-	c.MuteLog(false)
-	c.log("new %p\n", c)
-	go c.worker()
 	return c
 }
 
@@ -109,6 +106,8 @@ func (c *UDPClient) Connect(raddr *net.UDPAddr) (err error) {
 	if err != nil {
 		return
 	}
+	go c.worker()
+	go c.workerHelper()
 
 	c.isConnected = true
 	c.log("%s: UDP pipe opened to raddr '%s'\n", c.name, raddr)
@@ -117,20 +116,22 @@ func (c *UDPClient) Connect(raddr *net.UDPAddr) (err error) {
 }
 
 func (c *UDPClient) Close() error {
-	if c.isClosed {
+	if c.isClosed || !c.isConnected {
 		return nil
 	}
 
 	c.isClosed = true
 	c.isConnected = false
-	c.closeChannel <- struct{}{}
+	c.closeWorkerChannel <- struct{}{} // tell worker to stop
+	c.conn.Close() // tell workerHelper to stop
 
 	// do cleanup asynchronously
 	go func() {
 		if c.conn != nil {
 			c.conn.Close()
 		}
-		<-c.workerDone
+		<-c.workersDone
+		<-c.workersDone
 		c.conn = nil
 
 		// complete all outstanding requests
@@ -178,7 +179,6 @@ func (c *UDPClient) SendMessageNowExpectingNoResponse(message []byte) error {
 
 func (c *UDPClient) StartRequest(ctx context.Context, request *UDPRequestExpectingResponse) chan UDPRequestComplete {
 	c.MuteLog(false)
-	c.log("startreq %p\n", c)
 	if c.isClosed || !c.isConnected {
 		tempch := make(chan UDPRequestComplete, 1)
 		tempch <- UDPRequestComplete{
@@ -192,7 +192,6 @@ func (c *UDPClient) StartRequest(ctx context.Context, request *UDPRequestExpecti
 	rt := &UDPRequestTracker{ctx: ctx,
 						request: request,
 						complete: make(chan UDPRequestComplete, 1),
-						nextTimeout: time.Now(), // will be overwritten before using
 						triesFailed: 0}
 
 	conflictDetected := false
@@ -230,10 +229,10 @@ func (c *UDPClient) StartRequest(ctx context.Context, request *UDPRequestExpecti
 			c.inflight = append(c.inflight, rt)
 			// TODO: should non- Retryable requests get a longer timeout?
 			rt.nextTimeout = time.Now().Add(c.udpRetryTimeout)
-			// signal that there's work to do
-			if !c.inflightDoorbellRung {
-				c.inflightDoorbell <- struct{}{}
-			}
+		}
+		if !c.newRequestsAddedNotified {
+			c.newRequestsAddedNotification <- struct{}{}
+			c.newRequestsAddedNotified = true
 		}
 	}
 	c.queuesLock.Unlock()
@@ -306,18 +305,48 @@ func (c *UDPClient) sendRequest_NoLockHeld(rt *UDPRequestTracker) {
 	}
 }
 
+func (c *UDPClient) computeNextTimeout_Nonempty_LockHeld() {
+	// find the min time across the time that each thing is expected to happen
+	var nextTimeout time.Time
+	// pick a starting value to compare everything against
+	if len(c.inflight) > 0 {
+		nextTimeout = c.inflight[0].nextTimeout
+	} else { // we aren't being called unless there's something going on
+		nextTimeout = c.presumedDroppedResponses[0].forgetAfter
+	}
+	for _, presumedDropped := range c.presumedDroppedResponses {
+		if presumedDropped.forgetAfter.Before(nextTimeout) {
+			nextTimeout = presumedDropped.forgetAfter
+		}
+	}
+	for _, rt := range c.inflight {
+		if rt.nextTimeout.Before(nextTimeout) {
+			nextTimeout = rt.nextTimeout
+		}
+		deadline, ok := rt.ctx.Deadline()
+		if ok && deadline.Before(nextTimeout) {
+			nextTimeout = deadline
+		}
+	}
+	for _, rt := range c.queued {
+		deadline, ok := rt.ctx.Deadline()
+		if ok && deadline.Before(nextTimeout) {
+			nextTimeout = deadline
+		}
+	}
+	c.nextTimeout = nextTimeout
+}
+
 func (c *UDPClient) worker() {
 	defer util.Recover()
-	var err error
 	var rt *UDPRequestTracker
-	c.log("worker %p\n", c)
 
 	for {
-		var doSocketRead bool
+		var doTimedWait bool
 		var inflightRequestsToWrite []*UDPRequestTracker
 
 		c.queuesLock.Lock()
-		c.inflightDoorbellRung = false
+		c.newRequestsAddedNotified = false
 		if len(c.presumedDroppedResponses) > 0 || len(c.inflight) > 0 || len(c.queued) > 0 {
 			// refresh the data that we manage in case we can get rid of some for being out of date,
 			// or need to do a retry, or need to send a new request from the queue
@@ -378,8 +407,8 @@ func (c *UDPClient) worker() {
 		for !conflictDetected && len(c.queued) != 0 {
 			// prepare to send off the next queued requests if they no longer conflict
 			// (happens when the request(s) it was conflicting with have completed or been forgotten).
-			// do not read past queued[0] at any time so as to prevent a request from getting
-			// permanently stuck by a narrower request leapfrogging it repeatedly
+			// do not send past queued[0] at any time so as to prevent a request from getting
+			// permanently stuck by narrower requests leapfrogging it repeatedly
 			for _, presumedDropped := range c.presumedDroppedResponses {
 				if c.hasAmbiguity2(c.queued[0], presumedDropped) {
 					conflictDetected = true
@@ -403,34 +432,11 @@ func (c *UDPClient) worker() {
 		}
 		if len(c.inflight) > 0 || len(c.presumedDroppedResponses) > 0 {
 
-			// find the min time across the time that each thing is expected to happen
-			var nextTimeout time.Time
-			if len(c.inflight) > 0 {
-				nextTimeout = c.inflight[0].nextTimeout
-			} else {
-				nextTimeout = c.presumedDroppedResponses[0].forgetAfter
-			}
-			for _, rt := range c.inflight {
-				if rt.nextTimeout.Before(nextTimeout) {
-					nextTimeout = rt.nextTimeout
-				}
-			}
-			for _, presumedDropped := range c.presumedDroppedResponses {
-				if presumedDropped.forgetAfter.Before(nextTimeout) {
-					nextTimeout = presumedDropped.forgetAfter
-				}
-			}
-			c.nextTimeout = nextTimeout
+			c.computeNextTimeout_Nonempty_LockHeld()
+			doTimedWait = true
 
-			err = c.conn.SetReadDeadline(c.nextTimeout)
-
-			if err != nil {
-				panic(err)
-			}
-
-			doSocketRead = true
 		} else {
-			doSocketRead = false
+			doTimedWait = false
 		}
 
 		c.queuesLock.Unlock()
@@ -439,77 +445,89 @@ func (c *UDPClient) worker() {
 			c.sendRequest_NoLockHeld(rt)
 		}
 
-		if doSocketRead {
-			var n int
-			b := make([]byte, 65536)
-			n, err = c.conn.Read(b)
-			if err != nil {
-				if errors.Is(err, os.ErrDeadlineExceeded) {
-					err = nil // this was a general deadline, we'll check requests' individual timeouts next iteration
-				} else if c.isClosed {
-					err = nil // move on to cleanup
-				} else {
-					panic(err) // anything else recoverable? TODO this should close the class, not the app
+		// sleep until: class closed, new incoming messages, new outgoing messages sent, or (if we
+		// know of a timeout) the next timeout
+		if doTimedWait {
+			nowToCompare := time.Now()
+			if time.Now().Before(c.nextTimeout) {
+				select {
+				case <-c.closeWorkerChannel:
+					c.workersDone <- struct{}{}
+					return
+				case message := <-c.incomingMessages:
+					c.handleIncomingMessage(message)
+				case <-c.newRequestsAddedNotification:
+					// go to start of loop and reprocess timeouts
+				case <-time.After(c.nextTimeout.Sub(nowToCompare)):
+					// go to start of loop and reprocess timeouts
 				}
-			}
-			b = b[:n]
-
-			c.queuesLock.Lock()
-			foundDroppedPacket := false
-			for i, presumedDropped := range c.presumedDroppedResponses {
-				if bytes.HasPrefix(b, presumedDropped.ResponseMustBeginWith) {
-					presumedDropped.maxCount--
-					if presumedDropped.maxCount == 0 {
-						c.presumedDroppedResponses = append(c.presumedDroppedResponses[:i],
-							c.presumedDroppedResponses[i+1:]...)
-					}
-					foundDroppedPacket = true // wasn't so dropped after all
-					break
-				}
-			}
-			var i int
-			if !foundDroppedPacket {
-				for i, rt = range c.inflight {
-					if bytes.HasPrefix(b, rt.request.ResponseMustBeginWith) {
-						c.inflight = append(c.inflight[:i], c.inflight[i+1:]...)
-						if rt.triesFailed != 0 {
-							// we sent this request more than once, so more responses might come in
-							c.presumedDroppedResponses = append(c.presumedDroppedResponses, &UDPPresumedDropped{
-								ResponseMustBeginWith: rt.request.ResponseMustBeginWith,
-								forgetAfter: time.Now().Add(c.udpConfidentDroppedTime),
-								maxCount: rt.triesFailed,
-							})
-						}
-						// complete the request successfully!
-						rt.complete <- UDPRequestComplete{
-							Error: nil,
-							Answer: b,
-							Request: rt.request,
-						}
-						break
-					}
-				}
-			}
-			c.queuesLock.Unlock()
-
-			// check for closure
-			select {
-			case <-c.closeChannel:
-				c.workerDone <- struct{}{}
-				return
-			default:
 			}
 		} else {
-
-			// check for closure and sleep until a new request is inflight
 			select {
-			case <-c.closeChannel:
-				c.workerDone <- struct{}{}
+			case <-c.closeWorkerChannel:
+				c.workersDone <- struct{}{}
 				return
-			case <-c.inflightDoorbell:
+			case message := <-c.incomingMessages:
+				c.handleIncomingMessage(message)
+			case <-c.newRequestsAddedNotification:
+				// go to start of loop and reprocess timeouts
 			}
 		}
 	}
+}
+
+func (c *UDPClient) handleIncomingMessage(message []byte) {
+	c.queuesLock.Lock()
+	defer c.queuesLock.Unlock()
+	for i, presumedDropped := range c.presumedDroppedResponses {
+		if bytes.HasPrefix(message, presumedDropped.ResponseMustBeginWith) {
+			presumedDropped.maxCount--
+			if presumedDropped.maxCount == 0 {
+				c.presumedDroppedResponses = append(c.presumedDroppedResponses[:i],
+					c.presumedDroppedResponses[i+1:]...)
+			}
+			return // message can't match both a dropped packet expectation and an inflight request expectation
+		}
+	}
+	for i, rt := range c.inflight {
+		if bytes.HasPrefix(message, rt.request.ResponseMustBeginWith) {
+			c.inflight = append(c.inflight[:i], c.inflight[i+1:]...)
+			if rt.triesFailed != 0 {
+				// we sent this request more than once, so more responses might come in
+				c.presumedDroppedResponses = append(c.presumedDroppedResponses, &UDPPresumedDropped{
+					ResponseMustBeginWith: rt.request.ResponseMustBeginWith,
+					forgetAfter: time.Now().Add(c.udpConfidentDroppedTime),
+					maxCount: rt.triesFailed,
+				})
+			}
+			// complete the request successfully!
+			rt.complete <- UDPRequestComplete{
+				Error: nil,
+				Answer: message,
+				Request: rt.request,
+			}
+			return
+		}
+	}
+	c.log("%s: Dropping unexpected incoming UDP packet. its length was %d\n", c.name, len(message))
+}
+
+func (c *UDPClient) workerHelper() {
+	for {
+		message := make([]byte, 65536)
+		n, err := c.conn.Read(message) // sleep here until data comes in or the class gets closed
+		if err != nil {
+			if c.isClosed {
+				break // move on to cleanup
+			} else {
+				panic(err) // anything else recoverable? TODO this should close the class, not the app
+			}
+		}
+		message = message[:n]
+		c.incomingMessages <- message // sleep here until worker is ready for data
+	}
+
+	c.workersDone <- struct{}{}
 }
 
 // TODO remember to strings.TrimSpace()
