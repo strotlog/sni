@@ -15,8 +15,6 @@ type UDPClient struct {
 	name string
 
 	conn  *net.UDPConn
-	raddr *net.UDPAddr
-	laddr *net.UDPAddr
 
 	muteLog bool
 
@@ -42,9 +40,10 @@ const defaultUDPTries = 3
 const defaultUDPRetryTimeout = time.Millisecond*500
 const defaultUDPConfidentDroppedTime = time.Second * 5
 
-func NewUDPClient(name string) *UDPClient {
+func NewUDPClient(name string, conn *net.UDPConn) *UDPClient {
 	c := &UDPClient{
 		name: name,
+		conn: conn,
 		newRequestsAddedNotification: make(chan struct{}, 1),
 		closeWorkerChannel: make(chan struct{}, 5),
 		workersDone: make(chan struct{}, 2),
@@ -52,6 +51,10 @@ func NewUDPClient(name string) *UDPClient {
 		udpRetryTimeout: defaultUDPRetryTimeout,
 		udpConfidentDroppedTime: defaultUDPConfidentDroppedTime,
 	}
+	go c.worker()
+	go c.workerHelper()
+
+	c.isConnected = true
 	return c
 }
 
@@ -60,8 +63,6 @@ func (c *UDPClient) IsClosed() bool { return c.isClosed }
 func (c *UDPClient) MuteLog(muted bool) {
 	c.muteLog = muted
 }
-
-func (c *UDPClient) RemoteAddress() *net.UDPAddr { return c.raddr }
 
 func (c *UDPClient) SetUDPRetryTimeout(duration time.Duration) { c.udpRetryTimeout = duration }
 func (c *UDPClient) SetUDPConfidentDroppedTime(duration time.Duration) { c.udpConfidentDroppedTime = duration }
@@ -75,13 +76,6 @@ func (c *UDPClient) log(fmt string, args ...interface{}) {
 	log.Printf(fmt, args...)
 }
 
-func (c *UDPClient) LocalAddr() *net.UDPAddr {
-	if c.conn == nil {
-		return nil
-	}
-	return c.conn.LocalAddr().(*net.UDPAddr)
-}
-
 func (c *UDPClient) RemoteAddr() *net.UDPAddr {
 	if c.conn == nil {
 		return nil
@@ -89,30 +83,11 @@ func (c *UDPClient) RemoteAddr() *net.UDPAddr {
 	return c.conn.RemoteAddr().(*net.UDPAddr)
 }
 
-func (c *UDPClient) SetLocalAddr(addr *net.UDPAddr) {
-	c.laddr = addr
-}
-
-func (c *UDPClient) Connect(raddr *net.UDPAddr) (err error) {
-	c.log("%s: connect to server '%s'\n", c.name, raddr)
-
-	if c.isConnected {
-		return fmt.Errorf("%s: already connected to '%s'", c.name, c.raddr)
+func (c *UDPClient) LocalAddr() *net.UDPAddr {
+	if c.conn == nil {
+		return nil
 	}
-
-	c.raddr = raddr
-
-	c.conn, err = net.DialUDP("udp", c.laddr, raddr)
-	if err != nil {
-		return
-	}
-	go c.worker()
-	go c.workerHelper()
-
-	c.isConnected = true
-	c.log("%s: UDP pipe opened to raddr '%s'\n", c.name, raddr)
-
-	return
+	return c.conn.LocalAddr().(*net.UDPAddr)
 }
 
 func (c *UDPClient) Close() error {
@@ -122,7 +97,7 @@ func (c *UDPClient) Close() error {
 
 	c.isClosed = true
 	c.isConnected = false
-	c.closeWorkerChannel <- struct{}{} // tell worker to stop
+	c.closeWorkerChannel <- struct{}{} // tell worker to stop. could also close() on it for a similar effect
 	c.conn.Close() // tell workerHelper to stop
 
 	// do cleanup asynchronously
@@ -130,6 +105,7 @@ func (c *UDPClient) Close() error {
 		if c.conn != nil {
 			c.conn.Close()
 		}
+		// wait for both workers to unwind
 		<-c.workersDone
 		<-c.workersDone
 		c.conn = nil
@@ -280,7 +256,7 @@ func (c *UDPClient) hasAmbiguity2(request1 *UDPRequestTracker, request2 *UDPPres
 }
 
 // caller must ensure request is already stored in the c.inflight object
-// on send failure, we don't retry. request is pulled out of c.inflight and completed to sender (thus no return value)
+// on send failure, we don't retry. request is pulled out of c.inflight and completed to sender (thus no direct return value)
 func (c *UDPClient) sendRequest_NoLockHeld(rt *UDPRequestTracker) {
 
 	_, err := c.conn.Write([]byte(rt.request.UDPToSend))

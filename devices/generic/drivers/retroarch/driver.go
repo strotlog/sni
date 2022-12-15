@@ -2,7 +2,6 @@ package retroarch
 
 import (
 	"fmt"
-	"github.com/alttpo/snes/timing"
 	"log"
 	"net"
 	"net/url"
@@ -20,19 +19,32 @@ const driverName = "ra"
 
 var logDetector = false
 var driver *Driver
+var detectInterval = time.Second * 2
 
 type Driver struct {
 	container devices.DeviceContainer
 
 	localUdpPortsToAvoid map[int]struct{}
 
-	detectors []*retroarch.RAClient
+	detectorsCloser  chan struct{} // TODO if we ever get a close signal, call close(detectorsCloser) to stop the detectors
+	detectorsLock    sync.RWMutex  // inverted meaning: RLock() to write own entry, Lock() to read all entries
+	recentDetections []recentDetection
+	detectorAddrs    []*net.UDPAddr
+}
+
+type recentDetection struct {
+	raVersion           string
+	raVersionReceivedAt time.Time
+	system              string
+	systemReceivedAt    time.Time
 }
 
 func NewDriver(addresses []*net.UDPAddr) *Driver {
 	d := &Driver{
-		detectors:            make([]*retroarch.RAClient, len(addresses)),
 		localUdpPortsToAvoid: make(map[int]struct{}),
+		detectorsCloser:      make(chan struct{}),
+		recentDetections:     make([]recentDetection, len(addresses)),
+		detectorAddrs:        addresses,
 	}
 
 	// retroarch addresses are often on the local machine, so do not bind on any of their port numbers
@@ -42,9 +54,120 @@ func NewDriver(addresses []*net.UDPAddr) *Driver {
 
 	d.container = devices.NewDeviceDriverContainer(d.openDevice)
 
-	for i, addr := range addresses {
-		c := retroarch.NewRAClient(addr, fmt.Sprintf("retroarch[%d]", i), timing.Frame*4)
-		d.detectors[i] = c
+	// detect retroarch in the background
+	for detectorIndex, addr := range addresses {
+
+		conn, err := d.dialUDPWithGoodLocalPort(addr)
+		if err != nil {
+			log.Printf("retroarch: error: detector for %v has failed to create. connection error: %v",
+				addr,
+				err)
+			continue
+		}
+
+		// start writer
+		go func(d *Driver, conn *net.UDPConn) {
+			var err error
+
+			for {
+				if logDetector {
+					log.Printf("retroarch: detector write to %v > VERSION", conn.RemoteAddr().(*net.UDPAddr))
+				}
+				_, err = conn.Write([]byte("VERSION\n"))
+				if err != nil {
+					log.Printf("retroarch: error: detector for %v has died due to write error %v",
+						conn.RemoteAddr().(*net.UDPAddr),
+						err)
+					conn.Close()
+					return
+				}
+				if logDetector {
+					log.Printf("retroarch: detector write to %v > GET_STATUS", conn.RemoteAddr().(*net.UDPAddr))
+				}
+				_, err = conn.Write([]byte("GET_STATUS\n"))
+				if err != nil {
+					log.Printf("retroarch: error: detector for %v has died due to write error %v",
+						conn.RemoteAddr().(*net.UDPAddr),
+						err)
+					conn.Close()
+					return
+				}
+				time.Sleep(detectInterval)
+				select {
+				case <-d.detectorsCloser:
+					conn.Close()
+					return
+				default:
+				}
+			}
+
+		}(d, conn)
+
+		// start reader
+		go func(d *Driver, conn *net.UDPConn, detectorIndex int) {
+
+			conn.SetReadDeadline(time.Time{}) // no timeout, except if connection closes
+			message := make([]byte, 65536)
+			for {
+				n, err := conn.Read(message)
+				if err != nil {
+					select {
+					case <-d.detectorsCloser:
+						err = nil
+						return
+					default:
+					}
+				}
+				if err != nil {
+					log.Printf("retroarch: error: detector for %v has died due to read error %v",
+						conn.RemoteAddr().(*net.UDPAddr),
+						err)
+					conn.Close()
+					return
+				}
+				message = message[:n]
+
+				if major, minor, patch, ok := retroarch.RAParseVersion(message); ok {
+
+					if logDetector {
+						log.Printf("retroarch: detector received version response from %v < %s",
+							conn.RemoteAddr().(*net.UDPAddr),
+							strings.TrimSpace(string(message)))
+					}
+
+					d.detectorsLock.RLock()
+					{
+						d.recentDetections[detectorIndex].raVersion = fmt.Sprintf("%d.%d.%d", major, minor, patch)
+						d.recentDetections[detectorIndex].raVersionReceivedAt = time.Now()
+					}
+					d.detectorsLock.RUnlock()
+
+				} else if raStatus, systemId, _, _, ok := retroarch.RAParseGetStatus(message); ok {
+
+					if logDetector {
+						log.Printf("retroarch: detector received status response from %v < %s",
+							conn.RemoteAddr().(*net.UDPAddr),
+							strings.TrimSpace(string(message)))
+					}
+
+					if raStatus != "CONTENTLESS" { // CONTENTLESS means no systemId
+						d.detectorsLock.RLock()
+						{
+							d.recentDetections[detectorIndex].system = systemId
+							d.recentDetections[detectorIndex].systemReceivedAt = time.Now()
+						}
+						d.detectorsLock.RUnlock()
+					}
+
+				} else {
+					log.Printf("retroarch: detector received unknown response from %v, ignoring < %s",
+						conn.RemoteAddr().(*net.UDPAddr),
+						strings.TrimSpace(string(message)))
+				}
+				message = message[:cap(message)] // len = cap in order to read again
+			}
+
+		}(d, conn, detectorIndex)
 	}
 
 	return d
@@ -85,12 +208,12 @@ func (d *Driver) openDevice(uri *url.URL) (q devices.Device, err error) {
 		return
 	}
 
-	var c *retroarch.RAClient
-	c = retroarch.NewRAClient(addr, addr.String(), time.Second*5)
-	err = d.connectWithGoodLocalPort(c, addr)
+	conn, err := d.dialUDPWithGoodLocalPort(addr)
 	if err != nil {
 		return
 	}
+	var c *retroarch.RAClient
+	c = retroarch.NewRAClient(addr.String(), conn, time.Second*5)
 
 	c.MuteLog(false)
 
@@ -105,109 +228,59 @@ func (d *Driver) openDevice(uri *url.URL) (q devices.Device, err error) {
 	return
 }
 
-func (d *Driver) connectWithGoodLocalPort(client *retroarch.RAClient, raddr *net.UDPAddr) error {
+func (d *Driver) dialUDPWithGoodLocalPort(raddr *net.UDPAddr) (conn *net.UDPConn, err error) {
 	numPortAllocRetries := 30
 
 	for numPortAllocRetries > 0 {
 
-		err := client.Connect(raddr)
+		conn, err = net.DialUDP("udp", nil, raddr)
 		if err != nil {
 			if logDetector {
-				log.Printf("retroarch: connect to %s: %v\n", raddr.String(), err)
+				log.Printf("retroarch: connect local %s -> remote %s: %v\n", conn.LocalAddr().String(), conn.RemoteAddr().String(), err)
 			}
-			return err
+			return
 		}
 
 		// return if we allocated a good port
-		if _, ok := d.localUdpPortsToAvoid[client.GetLocalAddr().Port]; !ok {
-			return nil // success
+		if _, ok := d.localUdpPortsToAvoid[conn.LocalAddr().(*net.UDPAddr).Port]; !ok {
+			return // success
 		}
 
 		// retry. assumes multiple Connect() attempts tend to use different local ports
+		if logDetector {
+			log.Printf("retroarch: discarding just connected local udp %v -> remote udp %v to avoid future conflict. reconnecting", conn.LocalAddr(), conn.RemoteAddr())
+		}
+		conn.Close()
+		conn = nil
 		numPortAllocRetries--
 	}
-	err := fmt.Errorf("Could not allocate a port outside localUdpPortsToAvoid")
-	log.Printf("retroarch: %v")
-	return err
+	err = fmt.Errorf("Could not allocate a port outside localUdpPortsToAvoid")
+	return
 }
 
 func (d *Driver) Detect() (devs []devices.DeviceDescriptor, err error) {
-	devicesLock := sync.Mutex{}
-	devs = make([]devices.DeviceDescriptor, 0, len(d.detectors))
+	// for each detector: if we got both version + status responses in the last 5 seconds, it's a valid device
+	requiredRecency := time.Now().Add(-time.Second * 5)
+	d.detectorsLock.Lock()
+	defer d.detectorsLock.Unlock()
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(d.detectors))
-	for i, de := range d.detectors {
-		// run detectors in parallel:
-		go func(i int, detector *retroarch.RAClient) {
-			defer util.Recover()
-			defer wg.Done()
+	for i, recent := range d.recentDetections {
 
-			detector.MuteLog(true)
-
-			// reopen detector if necessary:
-			if detector.IsClosed() {
-				detector.Close()
-				// refresh detector:
-				c := retroarch.NewRAClient(detector.GetRemoteAddr(), fmt.Sprintf("retroarch[%d]", i), timing.Frame*4)
-				d.detectors[i] = c
-				c.MuteLog(true)
-				detector = c
-			}
-
-			// reconnect detector if necessary:
-			if !detector.IsConnected() {
-				// "connect" to this UDP endpoint:
-				err = d.connectWithGoodLocalPort(detector, detector.GetRemoteAddr())
-				if err != nil {
-					if logDetector {
-						log.Printf("retroarch: detect: detector[%d]: connect: %v\n", i, err)
-					}
-					return
-				}
-			}
-
-			// we need to check if the retroarch device is listening and running a snes:
-			var systemId string
-			systemId, err = detector.DetermineVersionAndSystemAndApi(logDetector)
-			if err != nil {
-				if logDetector {
-					log.Printf("retroarch: detect: detector[%d]: %s\n", i, err)
-				}
-				detector.Close()
-				return
-			}
-			if !detector.HasVersion() {
-				return
-			}
-			if systemId == "" {
-				if logDetector {
-					log.Printf("retroarch: no system loaded\n")
-				}
-				return
-			}
-			if systemId != "super_nes" {
-				if logDetector {
-					log.Printf("retroarch: running unrecognized system_id '%s'\n", systemId)
-				}
-				return
-			}
+		if recent.raVersionReceivedAt.After(requiredRecency) &&
+			recent.systemReceivedAt.After(requiredRecency) {
 
 			descriptor := devices.DeviceDescriptor{
-				Uri:                 url.URL{Scheme: driverName, Host: detector.GetRemoteAddr().String()},
-				DisplayName:         fmt.Sprintf("RetroArch v%s (%s)", detector.Version(), detector.GetRemoteAddr()),
+				Uri:                 url.URL{Scheme: driverName, Host: d.detectorAddrs[i].String()},
+				DisplayName:         fmt.Sprintf("RetroArch v%s (%s)", recent.raVersion, d.detectorAddrs[i]),
 				Kind:                d.Kind(),
 				Capabilities:        driverCapabilities[:],
 				DefaultAddressSpace: sni.AddressSpace_SnesABus,
 				System:              "snes",
 			}
 
-			devicesLock.Lock()
 			devs = append(devs, descriptor)
-			devicesLock.Unlock()
-		}(i, de)
+		}
 	}
-	wg.Wait()
 
 	err = nil
 	return
@@ -277,7 +350,7 @@ func DriverInit() {
 		log.Printf("enabling retroarch detector logging")
 	}
 
-	// register the driver:
+	// start connecting to addresses and register the driver:
 	driver = NewDriver(addresses)
 	devices.Register(driverName, driver)
 }
