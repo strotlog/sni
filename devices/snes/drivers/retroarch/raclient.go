@@ -485,8 +485,41 @@ func (c *RAClient) writeCommand() string {
 	}
 }
 
-func (c *RAClient) DefaultAddressSpace(context.Context) (sni.AddressSpace, error) {
-	return defaultAddressSpace, nil
+func (c *RAClient) RequiresMemoryMappingForAddressSpace(ctx context.Context, addressSpace sni.AddressSpace) (bool, error) {
+	if addressSpace == sni.AddressSpace_Raw {
+		return false, nil
+	}
+	if addressSpace == sni.AddressSpace_SnesABus {
+		return false, nil
+	}
+	if addressSpace == sni.AddressSpace_FxPakPro {
+		// assuming READ_CORE_RAM+WRITE_CORE_RAM are available, we can accept RAM and SRAM requests
+		// without knowing the memory mapping. so allow the connection to go forward. individual
+		// ROM-space requests can fail
+		return false, nil
+	}
+	return true, nil
+}
+
+func (c *RAClient) RequiresMemoryMappingForAddress(ctx context.Context, address devices.AddressTuple) (bool, error) {
+	if address.AddressSpace == sni.AddressSpace_Raw {
+		return false, nil
+	}
+	if address.AddressSpace == sni.AddressSpace_SnesABus {
+		return false, nil
+	}
+	if address.AddressSpace == sni.AddressSpace_FxPakPro {
+		// SRAM
+		if address.Address >= 0xE0_0000 && address.Address <= 0xEF_FFFF {
+			return false, nil
+		}
+		// WRAM
+		if address.Address >= 0xF5_0000 && address.Address <= 0xF6_FFFF {
+			return false, nil
+		}
+		return true, nil
+	}
+	return true, nil
 }
 
 var ErrRAUnknownMapping = fmt.Errorf("only WRAM is available, and SRAM in FxPakPro-space requests, due to falling back to RA RCR (READ_CORE_RAM) with no bus mapping")
