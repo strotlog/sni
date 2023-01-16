@@ -76,18 +76,18 @@ func (c *UDPClient) log(fmt string, args ...interface{}) {
 	log.Printf(fmt, args...)
 }
 
-func (c *UDPClient) RemoteAddr() *net.UDPAddr {
-	if c.conn == nil {
-		return nil
-	}
-	return c.conn.RemoteAddr().(*net.UDPAddr)
-}
-
 func (c *UDPClient) LocalAddr() *net.UDPAddr {
 	if c.conn == nil {
 		return nil
 	}
 	return c.conn.LocalAddr().(*net.UDPAddr)
+}
+
+func (c *UDPClient) RemoteAddr() *net.UDPAddr {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.RemoteAddr().(*net.UDPAddr)
 }
 
 func (c *UDPClient) Close() error {
@@ -339,13 +339,17 @@ func (c *UDPClient) worker() {
 				if rt.ctx.Err() != nil {
 					// sender doesn't want the request anymore
 					c.inflight = append(c.inflight[:i], c.inflight[i+1:]...)
+					c.presumedDroppedResponses = append(c.presumedDroppedResponses, &UDPPresumedDropped{
+						ResponseMustBeginWith: rt.request.ResponseMustBeginWith,
+						forgetAfter: time.Now().Add(c.udpConfidentDroppedTime),
+						maxCount: rt.triesFailed,
+					})
 					rt.complete <- UDPRequestComplete{
 						Error: rt.ctx.Err(),
 						Answer: nil,
 						Request: rt.request,
 					}
-				}
-				if time.Now().After(rt.nextTimeout) {
+				} else if time.Now().After(rt.nextTimeout) {
 					rt.triesFailed++
 					if rt.triesFailed >= defaultUDPTries || !rt.request.Retryable {
 						c.inflight = append(c.inflight[:i], c.inflight[i+1:]...)
@@ -355,7 +359,7 @@ func (c *UDPClient) worker() {
 							maxCount: rt.triesFailed,
 						})
 						rt.complete <- UDPRequestComplete{
-							Error: fmt.Errorf("Request did not get a response within the number of retries"),
+							Error: fmt.Errorf("UDP Request did not get a response within the number of retries"),
 							Answer: nil,
 							Request: rt.request,
 						}
@@ -489,6 +493,7 @@ func (c *UDPClient) handleIncomingMessage(message []byte) {
 }
 
 func (c *UDPClient) workerHelper() {
+	c.conn.SetReadDeadline(time.Time{}) // disable any timeout
 	for {
 		message := make([]byte, 65536)
 		n, err := c.conn.Read(message) // sleep here until data comes in or the class gets closed
@@ -496,7 +501,9 @@ func (c *UDPClient) workerHelper() {
 			if c.isClosed {
 				break // move on to cleanup
 			} else {
-				panic(err) // anything else recoverable? TODO this should close the class, not the app
+				log.Printf("%s: closing due to unexpected UDP Read error %v", c.name, err)
+				c.Close()
+				break
 			}
 		}
 		message = message[:n]
