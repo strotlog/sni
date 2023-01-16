@@ -21,11 +21,10 @@ type UDPClient struct {
 	isConnected bool
 	isClosed    bool
 
-	newRequestsAddedNotified     bool
-	newRequestsAddedNotification chan struct{}
-	closeWorkerChannel           chan struct{}
-	workersDone                  chan struct{}
-	incomingMessages             chan []byte
+	newRequestsAdded   chan struct{}
+	closeWorkerChannel chan struct{}
+	workersDone        chan struct{}
+	incomingMessages   chan []byte
 
 	queuesLock                  sync.Mutex
 	inflight                    []*UDPRequestTracker
@@ -44,7 +43,7 @@ func NewUDPClient(name string, conn *net.UDPConn) *UDPClient {
 	c := &UDPClient{
 		name: name,
 		conn: conn,
-		newRequestsAddedNotification: make(chan struct{}, 1),
+		newRequestsAdded: make(chan struct{}, 1),
 		closeWorkerChannel: make(chan struct{}, 5),
 		workersDone: make(chan struct{}, 2),
 		incomingMessages : make(chan []byte),
@@ -206,9 +205,10 @@ func (c *UDPClient) StartRequest(ctx context.Context, request *UDPRequestExpecti
 			// TODO: should non- Retryable requests get a longer timeout?
 			rt.nextTimeout = time.Now().Add(c.udpRetryTimeout)
 		}
-		if !c.newRequestsAddedNotified {
-			c.newRequestsAddedNotification <- struct{}{}
-			c.newRequestsAddedNotified = true
+		select {
+			// cause the worker to process requests if it hasn't been notified already (via non-blocking send)
+			case c.newRequestsAdded <- struct{}{}:
+			default:
 		}
 	}
 	c.queuesLock.Unlock()
@@ -322,7 +322,6 @@ func (c *UDPClient) worker() {
 		var inflightRequestsToWrite []*UDPRequestTracker
 
 		c.queuesLock.Lock()
-		c.newRequestsAddedNotified = false
 		if len(c.presumedDroppedResponses) > 0 || len(c.inflight) > 0 || len(c.queued) > 0 {
 			// refresh the data that we manage in case we can get rid of some for being out of date,
 			// or need to do a retry, or need to send a new request from the queue
@@ -436,7 +435,7 @@ func (c *UDPClient) worker() {
 					return
 				case message := <-c.incomingMessages:
 					c.handleIncomingMessage(message)
-				case <-c.newRequestsAddedNotification:
+				case <-c.newRequestsAdded:
 					// go to start of loop and reprocess timeouts
 				case <-time.After(c.nextTimeout.Sub(nowToCompare)):
 					// go to start of loop and reprocess timeouts
@@ -449,7 +448,7 @@ func (c *UDPClient) worker() {
 				return
 			case message := <-c.incomingMessages:
 				c.handleIncomingMessage(message)
-			case <-c.newRequestsAddedNotification:
+			case <-c.newRequestsAdded:
 				// go to start of loop and reprocess timeouts
 			}
 		}
