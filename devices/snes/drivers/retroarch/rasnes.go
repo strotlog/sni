@@ -73,6 +73,12 @@ type RAClient struct {
 
 	closeLock sync.Mutex
 	closed    bool
+
+	// TODO: protect with a lock once we read these as well
+	recentlySeenVersion   string
+	recentlySeenSystem    string
+	recentlyOkMaxSendSize int
+	recentlyOkMaxRecvSize int
 }
 
 func (c *RAClient) FatalError(cause error) devices.DeviceError {
@@ -978,4 +984,20 @@ func (c *RAClient) WriteThenRead(write []byte, deadline time.Time) (rsp []byte, 
 	rsp = completion.Answer
 	err = completion.Error
 	return
+}
+
+func (c *RAClient) RecentlySeenVersion(v string) {
+	c.recentlySeenVersion = v
+}
+
+func (c *RAClient) RecentlySeenSystem(s string) {
+	c.recentlySeenSystem = s
+}
+
+func (c *RAClient) RecentlyOkMaxSendSize(sendsz int) {
+	c.recentlyOkMaxSendSize = sendsz
+}
+
+func (c *RAClient) RecentlyOkMaxRecvSize(recvsz int) {
+	c.recentlyOkMaxRecvSize = recvsz
 }
